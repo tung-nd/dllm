@@ -49,23 +49,9 @@ def main(**kwargs):
         desc += f'-{opts.pop("desc")}'
         
     date = datetime.now().strftime("%Y-%m-%d")
-    training_args.run_dir = os.path.join(training_args.run_dir, date)
+    training_args.run_dir = os.path.join(training_args.run_dir, training_args.exp_name)
     training_args.training_state_dir = os.path.join(training_args.run_dir, f'STATES-{os.environ.get("SLURM_JOB_ID") or "tmp"}')
     dist.print0(f"Save training_args at {training_args.training_state_dir}")
-    # Pick output directory.
-    if dist.get_rank() != 0:
-        training_args.run_dir = None
-        
-    else:
-        prev_run_dirs = []
-        if os.path.isdir(training_args.run_dir):
-            prev_run_dirs = [x for x in os.listdir(training_args.run_dir) if os.path.isdir(os.path.join(training_args.run_dir, x))]
-        prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
-        prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
-        slurm_job_id = int(os.environ.get("SLURM_JOB_ID")) - 1 if os.environ.get("SLURM_JOB_ID", None) else -1
-        cur_run_id =  max(prev_run_ids + [slurm_job_id], default=-1) + 1
-        training_args.run_dir = os.path.join(training_args.run_dir, f'{cur_run_id:05d}-{desc}')
-        assert not os.path.exists(training_args.run_dir)
 
     # Print options.
     dump_dict = opts.copy()

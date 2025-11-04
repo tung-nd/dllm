@@ -22,6 +22,22 @@ from torch_utils import distributed as dist
 from torch_utils import misc
 from tqdm.auto import tqdm
 
+def find_latest_wandb_id(wandb_dir):
+    """
+    Helper to find the most recent WANDB run id in the directory.
+    """
+    run_id = None
+    if os.path.exists(wandb_dir) and os.path.isdir(wandb_dir):
+        runs = [
+            sub for sub in os.listdir(wandb_dir)
+            if os.path.isdir(os.path.join(wandb_dir, sub)) and sub.startswith("run-")
+        ]
+        if runs:
+            # Sort by mtime (most recent first)
+            runs = sorted(runs, key=lambda s: os.path.getmtime(os.path.join(wandb_dir, s)), reverse=True)
+            run_id = runs[0].split("-")[-1]
+    return run_id
+
 def forward_process(input_ids, t=None, mask_token_id=126336, eps=1e-3):
     B, N = input_ids.shape
     if t is None:
@@ -38,6 +54,7 @@ def forward_process(input_ids, t=None, mask_token_id=126336, eps=1e-3):
 
 def training_loop(
     run_dir             = '.',      # Output directory.
+    exp_name            = 'default',
     batch_size          = 512,
     data_loader_kwargs  = {},       # Options for torch.utils.data.DataLoader.
     network_kwargs      = {},       # Options for model and preconditioning.
@@ -147,14 +164,17 @@ def training_loop(
     
     # tensorboard 
     if rank == 0:
-        wandb.init(
+        wandb_init_kwargs = dict(
             entity='tungnd',
             project="dllm",
-            name=':'.join(run_dir.split('/')[-2:]),
+            name=exp_name,
             dir=run_dir,
             config=opts,
-            # mode='offline'
         )
+        resume_id = find_latest_wandb_id(os.path.join(run_dir, "wandb"))
+        if resume_id is not None:
+            wandb_init_kwargs.update({"id": resume_id, "resume": "must"})
+        wandb.init(**wandb_init_kwargs)
 
     dist.print0(f'Training for {total_steps} steps in {precision_dtype}...')
     dist.print0(f"Model with Param: {model_params}")
