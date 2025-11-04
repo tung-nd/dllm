@@ -1,0 +1,42 @@
+desc: S1K-AR-COT
+
+network_kwargs: 
+    class_name: networks.llada_ar_cot.LLaDAARCOT.from_pretrained
+    pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Instruct
+    trust_remote_code: true
+    torch_dtype: bfloat16
+
+tokenizer_kwargs:
+    class_name: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Instruct
+
+data_loader_kwargs:
+    class_name: dataloaders.reasoning.load_s1k_dataset
+    local_path: simplescaling/s1K
+    batch_size: 1
+    num_workers: 4
+
+optimizer_kwargs:
+    class_name: torch.optim.AdamW
+    lr: 5.0e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.00
+
+lr_scheduler_kwargs:
+    class_name: training.utils.lr_scheduler.cosine_with_warmup
+    step_warmup: 0
+    T_max: 1000
+
+# other training args
+training_args:
+    func_name: training.finetuning_ar_cot.training_loop
+    run_dir: runs/
+    total_steps: 1000
+    loss_scaling: 1.
+    grad_accumulation: 1
+    max_grad_norm: 1
+    seed: 113
+    val_frequency: 100
+    precision: bf16
+    skip_spike_grad: 1.0e+10
