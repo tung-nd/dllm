@@ -38,7 +38,17 @@ def find_latest_wandb_id(wandb_dir):
             run_id = runs[0].split("-")[-1]
     return run_id
 
-def forward_process(input_ids, t=None, mask_token_id=126336, eps=1e-3):
+def prepare_data(batch, tokenizer, device, max_length):
+    inputs = batch['inputs']
+    prompts = batch['prompts']
+    inputs_without_final_answer = batch['inputs_without_final_answer']
+    input_ids = tokenizer(inputs, return_tensors='pt', truncation=True, max_length=max_length, padding='max_length').input_ids
+    input_ids = input_ids.to(device)
+    tokenized_prompts = tokenizer(prompts, return_tensors='pt', truncation=True, max_length=max_length)
+    prompt_lengths = tokenized_prompts.attention_mask.sum(dim=1).to(device)
+    return input_ids, prompt_lengths
+
+def forward_process(input_ids, prompt_lengths, t=None, mask_token_id=126336, eps=1e-3):
     B, N = input_ids.shape
     if t is None:
         t = torch.rand((B,), device=input_ids.device)
@@ -48,7 +58,29 @@ def forward_process(input_ids, t=None, mask_token_id=126336, eps=1e-3):
 
     mask_indices = torch.rand((B, N), device=input_ids.device) < t
     noisy_batch = torch.where(mask_indices, mask_token_id, input_ids)
-    return noisy_batch, t, mask_indices
+    
+    # do not mask the prompt
+    token_positions = torch.arange(noisy_batch.shape[1], device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
+    prompt_mask = (token_positions < prompt_lengths.unsqueeze(1))
+    noisy_batch = torch.where(prompt_mask, input_ids, noisy_batch)
+    
+    return noisy_batch, t, prompt_mask
+
+def calculate_loss(model, noisy_batch, input_ids, prompt_mask, t):
+    # Calculate the answer length (including the padded <EOS> tokens)
+    prompt_mask = prompt_mask.to(torch.int64)    
+    answer_lengths = torch.sum((1 - prompt_mask), dim=-1, keepdim=True)
+    answer_lengths = answer_lengths.repeat(1, noisy_batch.shape[1])
+    
+    masked_indices = (noisy_batch == 126336)
+    logits = model(input_ids=noisy_batch).logits
+    
+    unscaled_token_loss = F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none')
+    unscaled_ce_loss = torch.sum(unscaled_token_loss / answer_lengths[masked_indices]) / input_ids.shape[0]
+    token_loss = unscaled_token_loss / t[masked_indices]
+    ce_loss = torch.sum(token_loss / answer_lengths[masked_indices]) / input_ids.shape[0]
+
+    return ce_loss, unscaled_ce_loss
 
 #----------------------------------------------------------------------------
 
@@ -72,6 +104,8 @@ def training_loop(
     resume_step         = 0,
     max_grad_norm       = 1000,
     val_frequency       = 100,
+    val_num_t           = 10,
+    checkpoint_frequency = 500,
     skip_spike_grad     = 10e10,
     tokenizer_kwargs    = {},
     activation_checkpointing = 'whole_layer',
@@ -88,6 +122,8 @@ def training_loop(
         "total_steps": total_steps,
         "loss_scaling": loss_scaling,
         "val_frequency": val_frequency,
+        "val_num_t": val_num_t,
+        "checkpoint_frequency": checkpoint_frequency,
         "grad_accumulation": grad_accumulation,
         "lr_scheduler_kwargs": lr_scheduler_kwargs,
         "precision": precision,
@@ -123,7 +159,7 @@ def training_loop(
     
     # Load dataset.
     dist.print0('Loading dataset...')
-    dataloader_iterator = dnnlib.util.construct_class_by_name(
+    train_dataloader, val_dataloader = dnnlib.util.construct_class_by_name(
         **data_loader_kwargs,
         tokenizer=tokenizer,
     )
@@ -140,19 +176,19 @@ def training_loop(
 
     accelerator = dist.get_accelerator()
     assert accelerator is not None
-    model, optimizer, dataloader_iterator, scheduler = accelerator.prepare(
-       model, optimizer, dataloader_iterator, scheduler
+    model, optimizer, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
+       model, optimizer, train_dataloader, val_dataloader, scheduler
     )
 
     if resume_state_dump is not None and os.path.exists(resume_state_dump):
         dist.print0(f"Resume from {resume_state_dump}")
         accelerator.load_state(resume_state_dump)
 
-    dataloader_iterator = iter(dataloader_iterator)
+    train_dataloader_iterator = iter(train_dataloader)
     if resume_state_dump is not None and os.path.exists(resume_state_dump):
         print(f"Resume from step {resume_step}, skipping training data ...")
         for i in range(resume_step):
-            next(dataloader_iterator)
+            next(train_dataloader_iterator)
 
     # Train.
     training_step = resume_step # 0 for default
@@ -171,9 +207,9 @@ def training_loop(
             dir=run_dir,
             config=opts,
         )
-        resume_id = find_latest_wandb_id(os.path.join(run_dir, "wandb"))
-        if resume_id is not None:
-            wandb_init_kwargs.update({"id": resume_id, "resume": "must"})
+        # resume_id = find_latest_wandb_id(os.path.join(run_dir, "wandb"))
+        # if resume_id is not None:
+        #     wandb_init_kwargs.update({"id": resume_id, "resume": "must"})
         wandb.init(**wandb_init_kwargs)
 
     dist.print0(f'Training for {total_steps} steps in {precision_dtype}...')
@@ -198,34 +234,10 @@ def training_loop(
         for round_idx in range(grad_accumulation):
             with misc.ddp_sync(model, sync=round_idx == grad_accumulation - 1):
                 with torch.autocast(device_type="cuda", enabled=True, dtype=precision_dtype):
-                    batch = next(dataloader_iterator)
-                    inputs = batch['inputs']
-                    prompts = batch['prompts']
-                    inputs_without_final_answer = batch['inputs_without_final_answer']
-                    input_ids = tokenizer(inputs, return_tensors='pt', truncation=True, max_length=model.config.max_sequence_length, padding='max_length').input_ids
-                    input_ids = input_ids.to(device)
-                    tokenized_prompts = tokenizer(prompts, return_tensors='pt', truncation=True, max_length=model.config.max_sequence_length)
-                    prompt_lengths = tokenized_prompts.attention_mask.sum(dim=1).to(device)
-                    
-                    noisy_batch, t, _ = forward_process(input_ids, t=None)
-                    
-                    # do not mask the prompt
-                    token_positions = torch.arange(noisy_batch.shape[1], device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
-                    prompt_mask = (token_positions < prompt_lengths.unsqueeze(1))
-                    noisy_batch[prompt_mask] = input_ids[prompt_mask]
-                    
-                    # Calculate the answer length (including the padded <EOS> tokens)
-                    prompt_mask = prompt_mask.to(torch.int64)    
-                    answer_lengths = torch.sum((1 - prompt_mask), dim=-1, keepdim=True)
-                    answer_lengths = answer_lengths.repeat(1, noisy_batch.shape[1])
-                    
-                    masked_indices = (noisy_batch == 126336)
-                    logits = model(input_ids=noisy_batch).logits
-                    
-                    unscaled_token_loss = F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none')
-                    unscaled_ce_loss = torch.sum(unscaled_token_loss / answer_lengths[masked_indices]) / input_ids.shape[0]
-                    token_loss = unscaled_token_loss / t[masked_indices]
-                    ce_loss = torch.sum(token_loss / answer_lengths[masked_indices]) / input_ids.shape[0]
+                    batch = next(train_dataloader_iterator)
+                    input_ids, prompt_lengths = prepare_data(batch, tokenizer, device, model.config.max_sequence_length)
+                    noisy_batch, t, prompt_mask = forward_process(input_ids, prompt_lengths, t=None)
+                    ce_loss, unscaled_ce_loss = calculate_loss(model, noisy_batch, input_ids, prompt_mask, t)
 
                 accelerator.backward(ce_loss)
 
@@ -268,7 +280,30 @@ def training_loop(
         training_step += 1
 
         if training_step % val_frequency == 0:
-            
+            model.eval()
+            with torch.no_grad():
+                all_t = torch.linspace(0, 1, val_num_t).to(device)
+                eps = 1e-3
+                all_t = (1 - eps) * all_t + eps
+                for val_t in all_t:
+                    val_ce_loss, val_unscaled_ce_loss = [], []
+                    for batch in val_dataloader:
+                        input_ids, prompt_lengths = prepare_data(batch, tokenizer, device, model.config.max_sequence_length)
+                        t = val_t.repeat(input_ids.shape[0])
+                        noisy_batch, t, prompt_mask = forward_process(input_ids, prompt_lengths, t=t)
+                        ce_loss, unscaled_ce_loss = calculate_loss(model, noisy_batch, input_ids, prompt_mask, t)
+                        val_ce_loss.append(ce_loss)
+                        val_unscaled_ce_loss.append(unscaled_ce_loss)
+                    val_ce_loss = torch.stack(val_ce_loss).mean()
+                    val_unscaled_ce_loss = torch.stack(val_unscaled_ce_loss).mean()
+                    # reduce the loss from all ranks
+                    val_ce_loss = accelerator.reduce(val_ce_loss, reduction="mean")
+                    val_unscaled_ce_loss = accelerator.reduce(val_unscaled_ce_loss, reduction="mean")
+                    if rank == 0:
+                        wandb.log({f'validation/ce_loss_{val_t:.2f}': val_ce_loss.item(), f'validation/unscaled_ce_loss_{val_t:.2f}': val_unscaled_ce_loss.item()}, step=training_step)
+            model.train()
+
+        if training_step % checkpoint_frequency == 0:
             state_dict = accelerator.get_state_dict(model)
             save_path = os.path.join(training_state_dir, f'training-state-{training_step:06d}')
             accelerator.save_state(save_path)
@@ -278,6 +313,7 @@ def training_loop(
                 accelerator.unwrap_model(model).save_pretrained(
                     save_path, state_dict=state_dict, safe_serialization=True
                 )
+        
         accelerator.wait_for_everyone()
        
         if training_step >= total_steps:

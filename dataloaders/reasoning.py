@@ -1,4 +1,4 @@
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from torch.utils.data import DataLoader
 import torch
 import numpy as np
@@ -50,29 +50,38 @@ def collate_fn_s1k(batch, tokenizer: AutoTokenizer):
 def load_s1k_dataset(
     local_path: str,
     batch_size: int,
-    split: str = 'train', 
     tokenizer: AutoTokenizer = None,
     num_workers: int = 8,
     rank: int = None,
     num_replicas: int = None,
     seed: int = 112, 
+    val_ratio: float = 0.01,
 ):
-    ds = load_dataset(local_path, split=split)
+    ds = load_dataset(local_path, split='train')
     ds = ds.with_format('torch')
     ds = ds.shuffle(seed=seed)
+    # split train and val
+    split = ds.train_test_split(test_size=val_ratio, seed=seed)
+    train_ds = split['train']
+    val_ds = split['test']
     if rank is not None and num_replicas is not None:
         sampler = InfiniteSampler(
-            ds, rank=rank, num_replicas=num_replicas, 
+            train_ds, rank=rank, num_replicas=num_replicas, 
         )
     else:
         sampler = InfiniteSampler(
-            ds, rank=get_rank(), num_replicas=get_world_size(), 
+            train_ds, rank=get_rank(), num_replicas=get_world_size(), 
         )
 
-    dl = DataLoader(
-        ds, collate_fn=lambda batch: collate_fn_s1k(batch, tokenizer),
+    train_dl = DataLoader(
+        train_ds, collate_fn=lambda batch: collate_fn_s1k(batch, tokenizer),
         batch_size=batch_size, sampler=sampler, 
         num_workers=num_workers, pin_memory=True, 
     )
+    val_dl = DataLoader(
+        val_ds, collate_fn=lambda batch: collate_fn_s1k(batch, tokenizer),
+        batch_size=batch_size,
+        num_workers=num_workers, pin_memory=True, 
+    )
 
-    return dl
+    return train_dl, val_dl

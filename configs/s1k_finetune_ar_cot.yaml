@@ -38,6 +38,8 @@ training_args:
     grad_accumulation: 1
     max_grad_norm: 1
     seed: 113
-    val_frequency: 1000
+    val_frequency: 100
+    val_num_t: 10
+    checkpoint_frequency: 500
     precision: bf16
     skip_spike_grad: 1.0e+10
