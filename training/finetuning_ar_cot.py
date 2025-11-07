@@ -38,17 +38,7 @@ def find_latest_wandb_id(wandb_dir):
             run_id = runs[0].split("-")[-1]
     return run_id
 
-def prepare_data(batch, tokenizer, device, max_length):
-    inputs = batch['inputs']
-    prompts = batch['prompts']
-    inputs_without_final_answer = batch['inputs_without_final_answer']
-    input_ids = tokenizer(inputs, return_tensors='pt', truncation=True, max_length=max_length, padding='max_length').input_ids
-    input_ids = input_ids.to(device)
-    tokenized_prompts = tokenizer(prompts, return_tensors='pt', truncation=True, max_length=max_length)
-    prompt_lengths = tokenized_prompts.attention_mask.sum(dim=1).to(device)
-    return input_ids, prompt_lengths
-
-def forward_process(input_ids, prompt_lengths, t=None, mask_token_id=126336, eps=1e-3):
+def forward_process(input_ids, prompt_cot_lengths, t, mask_token_id, eps=1e-3):
     B, N = input_ids.shape
     if t is None:
         t = torch.rand((B,), device=input_ids.device)
@@ -59,28 +49,39 @@ def forward_process(input_ids, prompt_lengths, t=None, mask_token_id=126336, eps
     mask_indices = torch.rand((B, N), device=input_ids.device) < t
     noisy_batch = torch.where(mask_indices, mask_token_id, input_ids)
     
-    # do not mask the prompt
+    # do not mask the prompt+cot tokens
     token_positions = torch.arange(noisy_batch.shape[1], device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
-    prompt_mask = (token_positions < prompt_lengths.unsqueeze(1))
-    noisy_batch = torch.where(prompt_mask, input_ids, noisy_batch)
+    prompt_cot_mask = (token_positions < prompt_cot_lengths.unsqueeze(1))
+    noisy_batch = torch.where(prompt_cot_mask, input_ids, noisy_batch)
     
-    return noisy_batch, t, prompt_mask
+    return noisy_batch, t
 
-def calculate_loss(model, noisy_batch, input_ids, prompt_mask, t):
-    # Calculate the answer length (including the padded <EOS> tokens)
-    prompt_mask = prompt_mask.to(torch.int64)    
-    answer_lengths = torch.sum((1 - prompt_mask), dim=-1, keepdim=True)
-    answer_lengths = answer_lengths.repeat(1, noisy_batch.shape[1])
+def calculate_loss(model, noisy_batch, input_ids, attention_mask, prompt_lengths, prompt_cot_lengths, t, mask_token_id):
+    # noisy_batch: [B, N]
+    # input_ids: [B, N]
+    # attention_mask: [B, N, N]
+    # prompt_lengths: [B]
+    # prompt_cot_lengths: [B]
+    # t: [B]
+    B, N = noisy_batch.shape
     
-    masked_indices = (noisy_batch == 126336)
-    logits = model(input_ids=noisy_batch).logits
+    logits = model(input_ids=noisy_batch, attention_mask=attention_mask).logits # [B, N, vocab_size]
     
-    unscaled_token_loss = F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none')
-    unscaled_ce_loss = torch.sum(unscaled_token_loss / answer_lengths[masked_indices]) / input_ids.shape[0]
-    token_loss = unscaled_token_loss / t[masked_indices]
-    ce_loss = torch.sum(token_loss / answer_lengths[masked_indices]) / input_ids.shape[0]
+    position_ids = torch.arange(N, device=noisy_batch.device).unsqueeze(0).repeat(B, 1)
+    
+    # loss for cot tokens
+    cot_mask = (position_ids >= prompt_lengths.unsqueeze(1)) & (position_ids <= prompt_cot_lengths.unsqueeze(1)) # [B, N]
+    cot_ce_loss = F.cross_entropy(logits[cot_mask], input_ids[cot_mask], reduction='none').mean()
+    masked_indices = (noisy_batch == mask_token_id)
+    unscaled_answer_loss = F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none').mean()
+    scaled_answer_loss = (F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none') / t[masked_indices]).mean()
+    # dist.print0('cot_ce_loss', cot_ce_loss)
+    # dist.print0('unscaled_answer_loss', unscaled_answer_loss)
+    # dist.print0('scaled_answer_loss', scaled_answer_loss)
+    # import sys
+    # sys.exit()
 
-    return ce_loss, unscaled_ce_loss
+    return cot_ce_loss, unscaled_answer_loss, scaled_answer_loss
 
 #----------------------------------------------------------------------------
 
@@ -152,10 +153,21 @@ def training_loop(
     # model.eval().to(device)
     model_params = misc.count_parameters(model)
     
-    model.model.set_activation_checkpointing(activation_checkpointing)
+    # model.model.set_activation_checkpointing(activation_checkpointing)
+    model.gradient_checkpointing_enable()
 
     # tokenizer
     tokenizer = dnnlib.util.construct_class_by_name(**tokenizer_kwargs)
+    if 'qwen' in tokenizer_kwargs.get('pretrained_model_name_or_path', '').lower() or 'llama' in tokenizer_kwargs.get('pretrained_model_name_or_path', '').lower():
+        embedding_weights = model.model.embed_tokens.weight.data
+        vocab_size = embedding_weights.shape[0]
+        random_emb = torch.randn_like(embedding_weights[0]).unsqueeze(0)*0.01
+        new_embedding_weights = torch.cat([embedding_weights, random_emb], dim=0)
+        model.model.embed_tokens.weight = torch.nn.Parameter(new_embedding_weights)
+        mask_token_id = vocab_size
+        # mask_token_id = 62
+    elif 'llada' in tokenizer_kwargs.get('pretrained_model_name_or_path', '').lower():
+        mask_token_id = 126336
     
     # Load dataset.
     dist.print0('Loading dataset...')
@@ -235,11 +247,32 @@ def training_loop(
             with misc.ddp_sync(model, sync=round_idx == grad_accumulation - 1):
                 with torch.autocast(device_type="cuda", enabled=True, dtype=precision_dtype):
                     batch = next(train_dataloader_iterator)
-                    input_ids, prompt_lengths = prepare_data(batch, tokenizer, device, model.config.max_sequence_length)
-                    noisy_batch, t, prompt_mask = forward_process(input_ids, prompt_lengths, t=None)
-                    ce_loss, unscaled_ce_loss = calculate_loss(model, noisy_batch, input_ids, prompt_mask, t)
+                    input_ids, prompt_lengths, prompt_cot_lengths, attention_mask, used_cot_ratio = batch
+                    input_ids = input_ids.to(device)
+                    prompt_lengths = prompt_lengths.to(device)
+                    prompt_cot_lengths = prompt_cot_lengths.to(device)
+                    attention_mask = attention_mask.to(device)
+                    used_cot_ratio = used_cot_ratio.to(device)
+                    noisy_batch, t = forward_process(
+                        input_ids,
+                        prompt_cot_lengths=prompt_cot_lengths,
+                        t=(1-used_cot_ratio), # more cutoff -> more noise
+                        mask_token_id=mask_token_id,
+                    ) # prompt+cot tokens are not masked
+                    cot_loss, unscaled_answer_loss, answer_loss = calculate_loss(
+                        model,
+                        noisy_batch,
+                        input_ids.roll(-1, dims=1),
+                        attention_mask,
+                        prompt_lengths,
+                        prompt_cot_lengths,
+                        t,
+                        mask_token_id=mask_token_id,
+                    )
+                    
+                    loss = (cot_loss + answer_loss) / 2
 
-                accelerator.backward(ce_loss)
+                accelerator.backward(loss)
 
         _grad_norm = accelerator.clip_grad_norm_(
             model.parameters(),
@@ -254,8 +287,10 @@ def training_loop(
         optimizer.step()
         
         # gather the loss and unscaled loss from all ranks for logging
-        reduced_unscaled_ce_loss = accelerator.reduce(unscaled_ce_loss.detach(), reduction="mean")
-        reduced_ce_loss = accelerator.reduce(ce_loss.detach(), reduction="mean")
+        reduced_cot_loss = accelerator.reduce(cot_loss.detach(), reduction="mean")
+        reduced_unscaled_answer_loss = accelerator.reduce(unscaled_answer_loss.detach(), reduction="mean")
+        reduced_answer_loss = accelerator.reduce(answer_loss.detach(), reduction="mean")
+        reduced_loss = accelerator.reduce(loss.detach(), reduction="mean")
         reduced_grad_norm = accelerator.reduce(torch.as_tensor(grad_norm, device=device, dtype=torch.float32), reduction="mean")
 
         if rank == 0:
@@ -263,15 +298,17 @@ def training_loop(
                 {
                     'training/lr': scheduler.get_lr()[0],
                     'training/grad_norm': reduced_grad_norm.item(),
-                    'training/ce_loss': reduced_ce_loss.item(),
-                    'training/unscaled_ce_loss': reduced_unscaled_ce_loss.item(),
+                    'training/cot_loss': reduced_cot_loss.item(),
+                    'training/answer_loss': reduced_unscaled_answer_loss.item(),
+                    'training/loss': reduced_loss.item(),
                 },
                 step=training_step
             )
         current_lr = scheduler.get_lr()[0]
         pbar.set_postfix({
-            'loss': f"{reduced_ce_loss.float().item():.4f}",
-            'unscaled_loss': f"{reduced_unscaled_ce_loss.float().item():.4f}",
+            'loss': f"{reduced_loss.float().item():.4f}",
+            'cot_loss': f"{reduced_cot_loss.float().item():.4f}",
+            'answer_loss': f"{reduced_unscaled_answer_loss.float().item():.4f}",
             'lr': f"{current_lr:.6f}",
             'grad': f"{reduced_grad_norm.float().item():.2f}",
         })
@@ -288,7 +325,7 @@ def training_loop(
                 for val_t in all_t:
                     val_ce_loss, val_unscaled_ce_loss = [], []
                     for batch in val_dataloader:
-                        input_ids, prompt_lengths = prepare_data(batch, tokenizer, device, model.config.max_sequence_length)
+                        input_ids, prompt_lengths, prompt_cot_lengths, attention_mask, used_cot_ratio = batch
                         t = val_t.repeat(input_ids.shape[0])
                         noisy_batch, t, prompt_mask = forward_process(input_ids, prompt_lengths, t=t)
                         ce_loss, unscaled_ce_loss = calculate_loss(model, noisy_batch, input_ids, prompt_mask, t)

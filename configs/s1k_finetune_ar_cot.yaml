@@ -1,14 +1,14 @@
 desc: S1K-AR-COT
 
 network_kwargs: 
-    class_name: networks.llada_ar_cot.LLaDAARCOT.from_pretrained
-    pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Instruct
+    class_name: transformers.AutoModelForCausalLM.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen2.5-7B-Instruct
     trust_remote_code: true
     torch_dtype: bfloat16
 
 tokenizer_kwargs:
     class_name: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Instruct
+    pretrained_model_name_or_path: Qwen/Qwen2.5-7B-Instruct
 
 data_loader_kwargs:
     class_name: dataloaders.reasoning.load_s1k_dataset
@@ -32,7 +32,7 @@ lr_scheduler_kwargs:
 training_args:
     func_name: training.finetuning_ar_cot.training_loop
     run_dir: /eagle/MDClimSim/tungnd/dllm/
-    exp_name: s1k_finetune_llada_1e-5_lr_cosine_decay_10k_steps
+    exp_name: test
     total_steps: 10000
     loss_scaling: 1.
     grad_accumulation: 1
