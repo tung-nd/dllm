@@ -289,7 +289,6 @@ def training_loop(
         # gather the loss and unscaled loss from all ranks for logging
         reduced_cot_loss = accelerator.reduce(cot_loss.detach(), reduction="mean")
         reduced_unscaled_answer_loss = accelerator.reduce(unscaled_answer_loss.detach(), reduction="mean")
-        reduced_answer_loss = accelerator.reduce(answer_loss.detach(), reduction="mean")
         reduced_loss = accelerator.reduce(loss.detach(), reduction="mean")
         reduced_grad_norm = accelerator.reduce(torch.as_tensor(grad_norm, device=device, dtype=torch.float32), reduction="mean")
 
@@ -322,22 +321,39 @@ def training_loop(
                 all_t = torch.linspace(0, 1, val_num_t).to(device)
                 eps = 1e-3
                 all_t = (1 - eps) * all_t + eps
+                logged_cot_loss = False
                 for val_t in all_t:
-                    val_ce_loss, val_unscaled_ce_loss = [], []
+                    val_cot_loss, val_unscaled_answer_loss, val_loss = [], [], []
                     for batch in val_dataloader:
                         input_ids, prompt_lengths, prompt_cot_lengths, attention_mask, used_cot_ratio = batch
                         t = val_t.repeat(input_ids.shape[0])
-                        noisy_batch, t, prompt_mask = forward_process(input_ids, prompt_lengths, t=t)
-                        ce_loss, unscaled_ce_loss = calculate_loss(model, noisy_batch, input_ids, prompt_mask, t)
-                        val_ce_loss.append(ce_loss)
-                        val_unscaled_ce_loss.append(unscaled_ce_loss)
-                    val_ce_loss = torch.stack(val_ce_loss).mean()
-                    val_unscaled_ce_loss = torch.stack(val_unscaled_ce_loss).mean()
+                        noisy_batch, t = forward_process(input_ids, prompt_cot_lengths, t=t, mask_token_id=mask_token_id)
+                        cot_loss, unscaled_answer_loss, answer_loss = calculate_loss(
+                            model,
+                            noisy_batch,
+                            input_ids.roll(-1, dims=1),
+                            attention_mask,
+                            prompt_lengths,
+                            prompt_cot_lengths,
+                            t,
+                            mask_token_id=mask_token_id,
+                        )
+                        val_cot_loss.append(cot_loss)
+                        val_unscaled_answer_loss.append(unscaled_answer_loss)
+                        val_loss.append(loss)
+                    val_cot_loss = torch.stack(val_cot_loss).mean()
+                    val_unscaled_answer_loss = torch.stack(val_unscaled_answer_loss).mean()
+                    val_loss = torch.stack(val_loss).mean()
                     # reduce the loss from all ranks
-                    val_ce_loss = accelerator.reduce(val_ce_loss, reduction="mean")
-                    val_unscaled_ce_loss = accelerator.reduce(val_unscaled_ce_loss, reduction="mean")
+                    val_cot_loss = accelerator.reduce(val_cot_loss, reduction="mean")
+                    val_unscaled_answer_loss = accelerator.reduce(val_unscaled_answer_loss, reduction="mean")
+                    val_loss = accelerator.reduce(val_loss, reduction="mean")
                     if rank == 0:
-                        wandb.log({f'validation/ce_loss_{val_t:.2f}': val_ce_loss.item(), f'validation/unscaled_ce_loss_{val_t:.2f}': val_unscaled_ce_loss.item()}, step=training_step)
+                        val_dict = {f'validation/unscaled_answer_loss_{val_t:.2f}': val_unscaled_answer_loss.item()}
+                        if not logged_cot_loss:
+                            val_dict['validation/cot_loss'] = val_cot_loss.item()
+                            logged_cot_loss = True
+                        wandb.log(val_dict, step=training_step)
             model.train()
 
         if training_step % checkpoint_frequency == 0:
