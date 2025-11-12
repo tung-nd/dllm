@@ -227,12 +227,25 @@ def training_loop(
 
     if resume_state_dump is not None and os.path.exists(resume_state_dump):
         dist.print0(f"Resume from {resume_state_dump}")
-        accelerator.load_state(resume_state_dump)
+        # Force torch.load to not use weights_only during state restoration.
+        _orig_torch_load = torch.load
+        def _no_weights_only_load(*args, **kwargs):
+            if 'weights_only' in kwargs:
+                kwargs['weights_only'] = False
+            return _orig_torch_load(*args, **kwargs)
+        torch.load = _no_weights_only_load
+        try:
+            accelerator.load_state(resume_state_dump)
+        finally:
+            torch.load = _orig_torch_load
 
     train_dataloader_iterator = iter(train_dataloader)
-    if resume_state_dump is not None and os.path.exists(resume_state_dump):
-        print(f"Resume from step {resume_step}, skipping training data ...")
-        for i in range(resume_step):
+    # Always advance the dataloader to align with previously consumed batches.
+    # We consumed 'grad_accumulation' batches per training step.
+    if resume_step and resume_step > 0:
+        skip_batches = resume_step * grad_accumulation
+        print(f"Resume from step {resume_step}, skipping {skip_batches} training batches to align dataloader ...")
+        for _ in range(skip_batches):
             next(train_dataloader_iterator)
 
     # Train.
@@ -252,9 +265,9 @@ def training_loop(
             dir=run_dir,
             config=opts,
         )
-        # resume_id = find_latest_wandb_id(os.path.join(run_dir, "wandb"))
-        # if resume_id is not None:
-        #     wandb_init_kwargs.update({"id": resume_id, "resume": "must"})
+        resume_id = find_latest_wandb_id(os.path.join(run_dir, "wandb"))
+        if resume_id is not None:
+            wandb_init_kwargs.update({"id": resume_id, "resume": "must"})
         wandb.init(**wandb_init_kwargs)
 
     dist.print0(f'Training for {total_steps} steps in {precision_dtype}...')
