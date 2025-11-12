@@ -1,0 +1,46 @@
+desc: OPENTHOUGTS-AR-COT
+
+network_kwargs: 
+    class_name: networks.qwen3_customized.Qwen3CustomizedForCausalLM.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-8B
+    trust_remote_code: true
+    torch_dtype: bfloat16
+
+tokenizer_kwargs:
+    class_name: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-8B
+
+data_loader_kwargs:
+    class_name: dataloaders.openthoughts.load_openthoughts_dataset
+    local_path: /eagle/MDClimSim/tungnd/data/hf_data/openthoughtsv3_filtered/
+    batch_size: 1
+    num_workers: 4
+
+optimizer_kwargs:
+    class_name: torch.optim.AdamW
+    lr: 1.0e-5
+    new_module_lr: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.00
+
+lr_scheduler_kwargs:
+    class_name: training.utils.lr_scheduler.cosine_with_warmup
+    step_warmup: 0
+    T_max: 10000
+
+# other training args
+training_args:
+    func_name: training.finetuning_ar_cot.training_loop
+    run_dir: /eagle/MDClimSim/tungnd/dllm/
+    exp_name: openthoughts_filtered_finetune_qwen3_8b_lora_answer_train_all_8_bs
+    total_steps: 10000
+    loss_scaling: 1.
+    grad_accumulation: 1
+    max_grad_norm: 1
+    seed: 113
+    val_frequency: 100
+    val_max_iterations: 50
+    checkpoint_frequency: 500
+    precision: bf16
+    skip_spike_grad: 1.0e+10

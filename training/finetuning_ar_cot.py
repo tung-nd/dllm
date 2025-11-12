@@ -21,6 +21,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch_utils import distributed as dist
 from torch_utils import misc
 from tqdm.auto import tqdm
+from networks.gated_lora import LoraGateContext, inject_gated_lora
 
 def find_latest_wandb_id(wandb_dir):
     """
@@ -56,16 +57,18 @@ def forward_process(input_ids, prompt_cot_lengths, t, mask_token_id, eps=1e-3):
     
     return noisy_batch, t
 
-def calculate_loss(model, noisy_batch, input_ids, attention_mask, prompt_lengths, prompt_cot_lengths, t, mask_token_id):
+def calculate_loss(model, noisy_batch, input_ids, lora_mask, prompt_lengths, prompt_cot_lengths, t, mask_token_id):
     # noisy_batch: [B, N]
     # input_ids: [B, N]
     # attention_mask: [B, N, N]
+    # lora_mask: [B, N]
     # prompt_lengths: [B]
     # prompt_cot_lengths: [B]
     # t: [B]
     B, N = noisy_batch.shape
     
-    logits = model(input_ids=noisy_batch, attention_mask=attention_mask).logits # [B, N, vocab_size]
+    with LoraGateContext(lora_mask):
+        logits = model(input_ids=noisy_batch, prompt_cot_lengths=prompt_cot_lengths).logits # [B, N, vocab_size]
     
     position_ids = torch.arange(N, device=noisy_batch.device).unsqueeze(0).repeat(B, 1)
     
@@ -73,7 +76,6 @@ def calculate_loss(model, noisy_batch, input_ids, attention_mask, prompt_lengths
     cot_mask = (position_ids >= prompt_lengths.unsqueeze(1)) & (position_ids <= prompt_cot_lengths.unsqueeze(1)) # [B, N]
     cot_ce_loss = F.cross_entropy(logits[cot_mask], input_ids[cot_mask], reduction='none').mean()
     masked_indices = (noisy_batch == mask_token_id)
-    unscaled_answer_loss = F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none').mean()
     scaled_answer_loss = (F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none') / t[masked_indices]).mean()
     # dist.print0('cot_ce_loss', cot_ce_loss)
     # dist.print0('unscaled_answer_loss', unscaled_answer_loss)
@@ -81,7 +83,7 @@ def calculate_loss(model, noisy_batch, input_ids, attention_mask, prompt_lengths
     # import sys
     # sys.exit()
 
-    return cot_ce_loss, unscaled_answer_loss, scaled_answer_loss
+    return cot_ce_loss, scaled_answer_loss
 
 #----------------------------------------------------------------------------
 
@@ -105,7 +107,7 @@ def training_loop(
     resume_step         = 0,
     max_grad_norm       = 1000,
     val_frequency       = 100,
-    val_num_t           = 10,
+    val_max_iterations  = 100,
     checkpoint_frequency = 500,
     skip_spike_grad     = 10e10,
     tokenizer_kwargs    = {},
@@ -123,7 +125,7 @@ def training_loop(
         "total_steps": total_steps,
         "loss_scaling": loss_scaling,
         "val_frequency": val_frequency,
-        "val_num_t": val_num_t,
+        "val_max_iterations": val_max_iterations,
         "checkpoint_frequency": checkpoint_frequency,
         "grad_accumulation": grad_accumulation,
         "lr_scheduler_kwargs": lr_scheduler_kwargs,
@@ -148,12 +150,28 @@ def training_loop(
     # Construct network.
     dist.print0('Constructing network...')
     model = dnnlib.util.construct_class_by_name(**network_kwargs) # subclass of torch.nn.Module
-    # model.config.flash_attention = True
-    model.train().requires_grad_(True).to(device)
-    # model.eval().to(device)
+    # Inject PEFT-like LoRA with gating
+    replaced = inject_gated_lora(
+        model,
+        target_keywords=("q_proj","k_proj","v_proj"),
+        r=128,
+        lora_alpha=256,
+        lora_dropout=0.05,
+    )
+    print("Replaced:", len(replaced), "modules with gated lora")
+
+    # Freeze everything except LoRA params (A/B) — mirrors PEFT training policy
+    model.train()
+    model.requires_grad_(True)
+    # for n, p in model.named_parameters():
+    #     if ".lora_A" in n or ".lora_B" in n:
+    #         p.requires_grad = True
+    #     else:
+    #         p.requires_grad = False
+    
     model_params = misc.count_parameters(model)
     
-    # model.model.set_activation_checkpointing(activation_checkpointing)
+    # # model.model.set_activation_checkpointing(activation_checkpointing)
     model.gradient_checkpointing_enable()
 
     # tokenizer
@@ -178,10 +196,25 @@ def training_loop(
 
     # Setup optimizer.
     dist.print0('Setting up optimizer...')
-    optimizer = dnnlib.util.construct_class_by_name(
-        params=[p for p in model.parameters() if p.requires_grad],
-        **optimizer_kwargs
-    )
+    # Build parameter groups for different lrs (original vs new LoRA params)
+    base_lr = optimizer_kwargs.get("lr", 1e-5)
+    new_module_lr = optimizer_kwargs.get("new_module_lr", base_lr)
+    new_module_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if ".lora_A" in name or ".lora_B" in name:
+            new_module_params.append(param)
+        else:
+            other_params.append(param)
+    param_groups = []
+    if other_params:
+        param_groups.append({"params": other_params, "lr": base_lr})
+    if new_module_params:
+        param_groups.append({"params": new_module_params, "lr": new_module_lr})
+    adamw_kwargs = {k: v for k, v in optimizer_kwargs.items() if k not in ["class_name", "lr", "new_module_lr"]}
+    optimizer = torch.optim.AdamW(param_groups, **adamw_kwargs)
 
     # Setup LR scheduler
     scheduler = LambdaLR(optimizer, lr_lambda=dnnlib.util.construct_class_by_name(**lr_scheduler_kwargs))
@@ -247,23 +280,24 @@ def training_loop(
             with misc.ddp_sync(model, sync=round_idx == grad_accumulation - 1):
                 with torch.autocast(device_type="cuda", enabled=True, dtype=precision_dtype):
                     batch = next(train_dataloader_iterator)
-                    input_ids, prompt_lengths, prompt_cot_lengths, attention_mask, used_cot_ratio = batch
+                    input_ids, prompt_lengths, prompt_cot_lengths, lora_mask, used_cot_ratio = batch
                     input_ids = input_ids.to(device)
                     prompt_lengths = prompt_lengths.to(device)
                     prompt_cot_lengths = prompt_cot_lengths.to(device)
-                    attention_mask = attention_mask.to(device)
+                    lora_mask = lora_mask.to(device)
                     used_cot_ratio = used_cot_ratio.to(device)
                     noisy_batch, t = forward_process(
                         input_ids,
                         prompt_cot_lengths=prompt_cot_lengths,
-                        t=(1-used_cot_ratio), # more cutoff -> more noise
+                        # t=(1-used_cot_ratio), # more cutoff -> more noise
+                        t=None,
                         mask_token_id=mask_token_id,
                     ) # prompt+cot tokens are not masked
-                    cot_loss, unscaled_answer_loss, answer_loss = calculate_loss(
+                    cot_loss, answer_loss = calculate_loss(
                         model,
                         noisy_batch,
                         input_ids.roll(-1, dims=1),
-                        attention_mask,
+                        lora_mask,
                         prompt_lengths,
                         prompt_cot_lengths,
                         t,
@@ -288,7 +322,7 @@ def training_loop(
         
         # gather the loss and unscaled loss from all ranks for logging
         reduced_cot_loss = accelerator.reduce(cot_loss.detach(), reduction="mean")
-        reduced_unscaled_answer_loss = accelerator.reduce(unscaled_answer_loss.detach(), reduction="mean")
+        reduced_answer_loss = accelerator.reduce(answer_loss.detach(), reduction="mean")
         reduced_loss = accelerator.reduce(loss.detach(), reduction="mean")
         reduced_grad_norm = accelerator.reduce(torch.as_tensor(grad_norm, device=device, dtype=torch.float32), reduction="mean")
 
@@ -298,7 +332,7 @@ def training_loop(
                     'training/lr': scheduler.get_lr()[0],
                     'training/grad_norm': reduced_grad_norm.item(),
                     'training/cot_loss': reduced_cot_loss.item(),
-                    'training/answer_loss': reduced_unscaled_answer_loss.item(),
+                    'training/answer_loss': reduced_answer_loss.item(),
                     'training/loss': reduced_loss.item(),
                 },
                 step=training_step
@@ -307,7 +341,7 @@ def training_loop(
         pbar.set_postfix({
             'loss': f"{reduced_loss.float().item():.4f}",
             'cot_loss': f"{reduced_cot_loss.float().item():.4f}",
-            'answer_loss': f"{reduced_unscaled_answer_loss.float().item():.4f}",
+            'answer_loss': f"{reduced_answer_loss.float().item():.4f}",
             'lr': f"{current_lr:.6f}",
             'grad': f"{reduced_grad_norm.float().item():.2f}",
         })
@@ -318,42 +352,46 @@ def training_loop(
         if training_step % val_frequency == 0:
             model.eval()
             with torch.no_grad():
-                all_t = torch.linspace(0, 1, val_num_t).to(device)
-                eps = 1e-3
-                all_t = (1 - eps) * all_t + eps
-                logged_cot_loss = False
-                for val_t in all_t:
-                    val_cot_loss, val_unscaled_answer_loss, val_loss = [], [], []
-                    for batch in val_dataloader:
-                        input_ids, prompt_lengths, prompt_cot_lengths, attention_mask, used_cot_ratio = batch
-                        t = val_t.repeat(input_ids.shape[0])
-                        noisy_batch, t = forward_process(input_ids, prompt_cot_lengths, t=t, mask_token_id=mask_token_id)
-                        cot_loss, unscaled_answer_loss, answer_loss = calculate_loss(
-                            model,
-                            noisy_batch,
-                            input_ids.roll(-1, dims=1),
-                            attention_mask,
-                            prompt_lengths,
-                            prompt_cot_lengths,
-                            t,
-                            mask_token_id=mask_token_id,
-                        )
-                        val_cot_loss.append(cot_loss)
-                        val_unscaled_answer_loss.append(unscaled_answer_loss)
-                        val_loss.append(loss)
-                    val_cot_loss = torch.stack(val_cot_loss).mean()
-                    val_unscaled_answer_loss = torch.stack(val_unscaled_answer_loss).mean()
-                    val_loss = torch.stack(val_loss).mean()
-                    # reduce the loss from all ranks
-                    val_cot_loss = accelerator.reduce(val_cot_loss, reduction="mean")
-                    val_unscaled_answer_loss = accelerator.reduce(val_unscaled_answer_loss, reduction="mean")
-                    val_loss = accelerator.reduce(val_loss, reduction="mean")
-                    if rank == 0:
-                        val_dict = {f'validation/unscaled_answer_loss_{val_t:.2f}': val_unscaled_answer_loss.item()}
-                        if not logged_cot_loss:
-                            val_dict['validation/cot_loss'] = val_cot_loss.item()
-                            logged_cot_loss = True
-                        wandb.log(val_dict, step=training_step)
+                # Inner validation progress over iterations for a specific t
+                val_inner_pbar = tqdm(
+                    total=val_max_iterations,
+                    desc=f"Val",
+                    dynamic_ncols=True,
+                    leave=False,
+                    disable=(rank != 0),
+                )
+                val_cot_loss, val_answer_loss = [], []
+                val_iterations = 0
+                for batch in val_dataloader:
+                    if val_iterations >= val_max_iterations:
+                        break
+                    val_iterations += 1
+                    input_ids, prompt_lengths, prompt_cot_lengths, lora_mask, used_cot_ratio = batch
+                    t = 1 - used_cot_ratio
+                    noisy_batch, t = forward_process(input_ids, prompt_cot_lengths, t=t, mask_token_id=mask_token_id)
+                    cot_loss, answer_loss = calculate_loss(
+                        model,
+                        noisy_batch,
+                        input_ids.roll(-1, dims=1),
+                        lora_mask,
+                        prompt_lengths,
+                        prompt_cot_lengths,
+                        t,
+                        mask_token_id=mask_token_id,
+                    )
+                    val_cot_loss.append(cot_loss)
+                    val_answer_loss.append(answer_loss)
+                    val_inner_pbar.update(1)
+                val_inner_pbar.close()
+                val_cot_loss = torch.stack(val_cot_loss).mean()
+                val_answer_loss = torch.stack(val_answer_loss).mean()
+                # reduce the loss from all ranks
+                val_cot_loss = accelerator.reduce(val_cot_loss, reduction="mean")
+                val_answer_loss = accelerator.reduce(val_answer_loss, reduction="mean")
+                if rank == 0:
+                    val_dict = {f'validation/answer_loss': val_answer_loss.item()}
+                    val_dict['validation/cot_loss'] = val_cot_loss.item()
+                    wandb.log(val_dict, step=training_step)
             model.train()
 
         if training_step % checkpoint_frequency == 0:
