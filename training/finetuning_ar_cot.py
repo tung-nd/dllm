@@ -151,14 +151,14 @@ def training_loop(
     dist.print0('Constructing network...')
     model = dnnlib.util.construct_class_by_name(**network_kwargs) # subclass of torch.nn.Module
     # Inject PEFT-like LoRA with gating
-    replaced = inject_gated_lora(
-        model,
-        target_keywords=("q_proj","k_proj","v_proj"),
-        r=128,
-        lora_alpha=256,
-        lora_dropout=0.05,
-    )
-    print("Replaced:", len(replaced), "modules with gated lora")
+    # replaced = inject_gated_lora(
+    #     model,
+    #     target_keywords=("q_proj","k_proj","v_proj"),
+    #     r=128,
+    #     lora_alpha=256,
+    #     lora_dropout=0.05,
+    # )
+    # print("Replaced:", len(replaced), "modules with gated lora")
 
     # Freeze everything except LoRA params (A/B) — mirrors PEFT training policy
     model.train()
@@ -179,10 +179,10 @@ def training_loop(
     if 'qwen' in tokenizer_kwargs.get('pretrained_model_name_or_path', '').lower() or 'llama' in tokenizer_kwargs.get('pretrained_model_name_or_path', '').lower():
         embedding_weights = model.model.embed_tokens.weight.data
         vocab_size = embedding_weights.shape[0]
-        random_emb = torch.randn_like(embedding_weights[0]).unsqueeze(0)*0.01
-        new_embedding_weights = torch.cat([embedding_weights, random_emb], dim=0)
-        model.model.embed_tokens.weight = torch.nn.Parameter(new_embedding_weights)
-        mask_token_id = vocab_size
+        # random_emb = torch.randn_like(embedding_weights[0]).unsqueeze(0)*0.01
+        # new_embedding_weights = torch.cat([embedding_weights, random_emb], dim=0)
+        # model.model.embed_tokens.weight = torch.nn.Parameter(new_embedding_weights)
+        mask_token_id = vocab_size - 1
         # mask_token_id = 62
     elif 'llada' in tokenizer_kwargs.get('pretrained_model_name_or_path', '').lower():
         mask_token_id = 126336

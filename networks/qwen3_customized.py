@@ -23,6 +23,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.integrations.sdpa_attention import logger, repeat_kv, use_gqa_in_sdpa
 from transformers.utils import is_torch_npu_available
+from .gated_lora import inject_gated_lora
 
 _is_torch_npu_available = is_torch_npu_available()
 
@@ -74,6 +75,22 @@ def customized_sdpa_attention_forward(
         if attention_mask is not None and attention_mask.dtype != torch.bool:
             # Convert to boolean type, making sdpa to force call FlashAttentionScore to improve performance.
             attention_mask = torch.logical_not(attention_mask.bool()).to(query.device)
+    
+    if "prompt_cot_lengths" not in kwargs:
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query, # [B, nq_heads, seq_len, head_dim]
+            key, # [B, nk_heads, seq_len, head_dim]
+            value, # [B, nk_heads, seq_len, head_dim]
+            attn_mask=attention_mask,
+            dropout_p=dropout,
+            scale=scaling,
+            is_causal=is_causal,
+            **sdpa_kwargs,
+        )
+        
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        return attn_output, None
     
     split_pos = kwargs["prompt_cot_lengths"]
     B = query.shape[0]
@@ -268,7 +285,7 @@ class Qwen3CustomizedModel(Qwen3CustomizedPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size+1, config.hidden_size, self.padding_idx) # +1 for the mask token
         self.layers = nn.ModuleList(
             [Qwen3CustomizedDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -365,6 +382,16 @@ class Qwen3CustomizedForCausalLM(Qwen3CustomizedPreTrainedModel, GenerationMixin
         self.model = Qwen3CustomizedModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        # Inject PEFT-like LoRA with gating
+        replaced = inject_gated_lora(
+            self,
+            target_keywords=("q_proj","k_proj","v_proj"),
+            r=128,
+            lora_alpha=256,
+            lora_dropout=0.05,
+        )
+        print("Replaced:", len(replaced), "modules with gated lora")
 
         # Initialize weights and apply final processing
         self.post_init()

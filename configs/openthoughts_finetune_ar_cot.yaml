@@ -2,7 +2,7 @@ desc: OPENTHOUGTS-AR-COT
 
 network_kwargs: 
     class_name: networks.qwen3_customized.Qwen3CustomizedForCausalLM.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3-8B
+    pretrained_model_name_or_path: /eagle/MDClimSim/tungnd/dllm/openthoughts_filtered_finetune_qwen3_8b_lora_answer_train_all_8_bs/ckpt-001000/
     trust_remote_code: true
     torch_dtype: bfloat16
 
@@ -20,7 +20,7 @@ optimizer_kwargs:
     class_name: torch.optim.AdamW
     lr: 1.0e-5
     new_module_lr: 1.0e-4
-    betas: [0.9, 0.999]
+    betas: [0.9, 0.95]
     eps: 1.0e-8
     weight_decay: 0.00
 
@@ -41,6 +41,6 @@ training_args:
     seed: 113
     val_frequency: 100
     val_max_iterations: 50
-    checkpoint_frequency: 500
+    checkpoint_frequency: 100
     precision: bf16
     skip_spike_grad: 1.0e+10

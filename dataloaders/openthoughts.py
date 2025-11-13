@@ -31,17 +31,18 @@ def collate_fn_openthoughts(batch, tokenizer: AutoTokenizer, max_length: int):
         input = tokenizer.apply_chat_template(prompt + response, tokenize=False)
         assert "</think>\n" in input, "</think>\n not in input"
         prompt_cot = input.split("</think>")[0] + "</think>"
-        prompt = tokenizer.apply_chat_template(prompt, tokenize=False)
+        prompt = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False)
+        
+        cot = prompt_cot[len(prompt):]
+        answer = input[len(prompt_cot):]
         
         # tokenize with no padding or truncation
         prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
         prompt_length = prompt_ids.shape[0]
-        prompt_cot_ids = tokenizer(prompt_cot, return_tensors="pt").input_ids[0]
-        cot_ids = prompt_cot_ids[prompt_length:]
+        cot_ids = tokenizer(cot, return_tensors="pt").input_ids[0]
         cot_length = cot_ids.shape[0]
-        input_ids = tokenizer(input, return_tensors="pt").input_ids[0]
-        answer_length = input_ids.shape[0] - (cot_length + prompt_length)
-        answer_ids = input_ids[-answer_length:]
+        answer_ids = tokenizer(answer, return_tensors="pt").input_ids[0]
+        answer_length = answer_ids.shape[0]
         
         # randomly cutoff the reasoning tokens to have prompt + partial reasoning + answer
         max_used_cot_length = min(cot_length, max_length - prompt_length - answer_length)
